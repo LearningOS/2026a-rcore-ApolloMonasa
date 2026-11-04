@@ -22,6 +22,7 @@ use lazy_static::*;
 use switch::__switch;
 pub use task::{TaskControlBlock, TaskStatus};
 
+use crate::mm::{MapPermission, VirtAddr};
 pub use context::TaskContext;
 
 /// The task manager, where all the tasks are managed.
@@ -133,6 +134,49 @@ impl TaskManager {
         inner.tasks[cur].change_program_brk(size)
     }
 
+    /// 为当前 `Running` 任务惰性映射一段虚拟内存（sys_mmap 用）
+    pub fn mmap_current(
+        &self,
+        start: usize,
+        len: usize,
+        permission: MapPermission,
+    ) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        if inner.tasks[cur].memory_set.insert_framed_area_lazy(
+            VirtAddr::from(start),
+            VirtAddr::from(start + len),
+            permission,
+        ) {
+            0
+        } else {
+            -1
+        }
+    }
+
+    /// 取消当前 `Running` 任务一段精确匹配的映射（sys_munmap 用）
+    pub fn munmap_current(
+        &self,
+        start: usize,
+        len: usize,
+    ) -> isize {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        let start_vpn = VirtAddr::from(start).floor();
+        let end_vpn = VirtAddr::from(start + len).ceil();
+        if inner.tasks[cur].memory_set.remove_area_with_range(start_vpn, end_vpn) {
+            0
+        } else {
+            -1
+        }
+    }
+
+    /// 尝试为当前 `Running` 任务处理 va 处的缺页（trap 层用）
+    pub fn handle_page_fault_current(&self, va: VirtAddr, permission: MapPermission) -> bool {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].memory_set.handle_page_fault(va, permission)
+    }
     /// Switch current `Running` task to the task we have found,
     /// or there is no `Ready` task and we can exit with all applications completed
     fn run_next_task(&self) {
@@ -152,6 +196,19 @@ impl TaskManager {
         } else {
             panic!("All applications completed!");
         }
+    }
+    /// 记录当前 `Running` 任务的一次系统调用
+    pub fn record_syscall(&self, syscall_id: usize) {
+        let mut inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id] += 1;
+    }
+
+    /// 查询当前 `Running` 任务第 syscall_id 号系统调用的累计次数
+    pub fn get_syscall_times(&self, syscall_id: usize) -> u32 {
+        let inner = self.inner.exclusive_access();
+        let cur = inner.current_task;
+        inner.tasks[cur].syscall_times[syscall_id]
     }
 }
 
@@ -201,4 +258,27 @@ pub fn current_trap_cx() -> &'static mut TrapContext {
 /// Change the current 'Running' task's program break
 pub fn change_program_brk(size: i32) -> Option<usize> {
     TASK_MANAGER.change_current_program_brk(size)
+}
+
+/// 为当前 `Running` 任务 mmap
+pub fn mmap_current(start: usize, len: usize, permission: MapPermission) -> isize {
+    TASK_MANAGER.mmap_current(start, len, permission)
+}
+/// 为当前 `Running` 任务 munmap
+pub fn munmap_current(start: usize, len: usize) -> isize {
+    TASK_MANAGER.munmap_current(start, len)
+}
+
+/// 尝试为当前 `Running` 任务处理缺页
+pub fn handle_page_fault_current(va: VirtAddr, permission: MapPermission) -> bool {
+    TASK_MANAGER.handle_page_fault_current(va, permission)
+}
+/// 记录当前 `Running` 任务的一次系统调用
+pub fn record_syscall(syscall_id: usize) {
+    TASK_MANAGER.record_syscall(syscall_id);
+}
+
+/// 查询当前 `Running` 任务某号系统调用的累计次数
+pub fn get_syscall_times(syscall_id: usize) -> u32 {
+    TASK_MANAGER.get_syscall_times(syscall_id)
 }

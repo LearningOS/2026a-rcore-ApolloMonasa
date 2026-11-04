@@ -262,6 +262,83 @@ impl MemorySet {
             false
         }
     }
+    /// 检查 [start_vpn, end_vpn) 是否与任一已有 area 的 vpn 区间重叠
+    fn has_overlap(&self, start_vpn: VirtPageNum, end_vpn: VirtPageNum) -> bool {
+        self.areas.iter().any(|area| {
+            let s = area.vpn_range.get_start();
+            let e = area.vpn_range.get_end();
+            s < end_vpn && e > start_vpn
+        })
+    }
+
+    /// 惰性登记一段 Framed 映射：只记录 vpn 范围与权限，不分配任何物理帧；
+    /// 帧在首次访问触发缺页时由 handle_page_fault 补上。
+    /// 与已有映射重叠时返回 false。
+    pub fn insert_framed_area_lazy(
+        &mut self,
+        start_va: VirtAddr,
+        end_va: VirtAddr,
+        permission: MapPermission,
+    ) -> bool {
+        let start_vpn = start_va.floor();
+        let end_vpn = end_va.ceil();
+        if self.has_overlap(start_vpn, end_vpn) {
+            return false;
+        }
+        let area = MapArea::new(start_va, end_va, MapType::Framed, permission);
+        // 惰性的关键:不走MemorySet的push,而是直接push到Vec里面
+        self.areas.push(area);
+        true
+    }
+
+    /// 删除 vpn 区间精确等于 [start_vpn, end_vpn) 的 area，归还其全部物理帧。
+    /// 找不到精确匹配的 area 时返回 false。
+    pub fn remove_area_with_range(
+        &mut self,
+        start_vpn: VirtPageNum,
+        end_vpn: VirtPageNum,
+    ) -> bool {
+        if let Some(idx) = self.areas.iter().position(
+            |area| area.vpn_range.get_start() == start_vpn && area.vpn_range.get_end() == end_vpn
+        ) {
+            let area = self.areas.remove(idx);
+            // 只解除真正映射过的页：惰性 area 的多数页从未映射，
+            // PageTable::unmap 对未映射的 vpn 会 assert panic
+            for vpn in area.data_frames.keys() {
+                self.page_table.unmap(*vpn);
+            }
+            true
+        } else {
+            false
+        }
+    }
+
+    /// 处理 va 上的缺页：当且仅当它落在某个 area 内、该 area 权限包含
+    /// need_perm、且该页尚未分配过时，补分配一个物理帧并建立映射。
+    /// 返回 false 表示无法处理，调用方（trap 层）应终止当前任务。
+    pub fn handle_page_fault(
+        &mut self,
+        va: VirtAddr,
+        need_perm: MapPermission,
+    ) -> bool {
+        let vpn = va.floor();
+        if let Some(area) = self.areas.iter_mut().find(|area| {
+            area.vpn_range.get_start() <= vpn && vpn < area.vpn_range.get_end()
+        }) {
+            if !area.map_perm.contains(need_perm) {
+                return false;
+            }
+            if area.data_frames.contains_key(&vpn) {
+                // 已分配仍缺页：说明是硬件拒绝的权限组合（如 W-only 保留编码），
+                // 再分配会在 PageTable::map 的 assert 上打崩内核
+                return false;
+            }
+            area.map_one(&mut self.page_table, vpn);
+            true
+        } else {
+            false
+        }
+    }
 }
 /// map area structure, controls a contiguous piece of virtual memory
 pub struct MapArea {
@@ -287,6 +364,7 @@ impl MapArea {
             map_perm,
         }
     }
+    /// 根据映射类型，添加一个映射到page_table里面
     pub fn map_one(&mut self, page_table: &mut PageTable, vpn: VirtPageNum) {
         let ppn: PhysPageNum;
         match self.map_type {

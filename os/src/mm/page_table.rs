@@ -179,3 +179,44 @@ pub fn translated_byte_buffer(token: usize, ptr: *const u8, len: usize) -> Vec<&
     }
     v
 }
+/// Translate&Copy a ptr[u8] array with LENGTH len to a mutable u8 Vec through
+/// page table, returning None when any page in the range is unmapped or
+/// lacks the required permission (R for read, W for write).
+pub fn translated_byte_buffer_checked(
+    token: usize,
+    ptr: *const u8,
+    len: usize,
+    need_write: bool,
+) -> Option<Vec<&'static mut [u8]>> {
+    let page_table = PageTable::from_token(token);
+    let mut start = VirtAddr::from(ptr as usize).0;
+    let end = (ptr as usize).checked_add(len)?;
+    let end = VirtAddr::from(end).0;
+    // 防止回环地址
+    if len > 0 && end <= start {
+        return None;
+    }
+    let mut v = Vec::new();
+    while start < end {
+        let start_va = VirtAddr::from(start);
+        let mut vpn = start_va.floor();
+        let pte = page_table.translate(vpn)?;
+        if !pte.is_valid() || !pte.readable() {
+            return None;
+        }
+        if need_write && !pte.writable() {
+            return None;
+        }
+        let ppn = pte.ppn();
+        vpn.step();
+        let mut end_va: VirtAddr = vpn.into();
+        end_va = end_va.min(VirtAddr::from(end));
+        if end_va.page_offset() == 0 {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..]);
+        } else {
+            v.push(&mut ppn.get_bytes_array()[start_va.page_offset()..end_va.page_offset()]);
+        }
+        start = end_va.0;
+    }
+    Some(v)
+}

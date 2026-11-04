@@ -16,9 +16,7 @@ mod context;
 
 use crate::config::{TRAMPOLINE, TRAP_CONTEXT_BASE};
 use crate::syscall::syscall;
-use crate::task::{
-    current_trap_cx, current_user_token, exit_current_and_run_next, suspend_current_and_run_next,
-};
+use crate::task::{current_trap_cx, current_user_token, exit_current_and_run_next, handle_page_fault_current, suspend_current_and_run_next};
 use crate::timer::set_next_trigger;
 use core::arch::{asm, global_asm};
 use riscv::register::{
@@ -72,11 +70,21 @@ pub fn trap_handler() -> ! {
             // get system call return value
             cx.x[10] = syscall(cx.x[17], [cx.x[10], cx.x[11], cx.x[12]]) as usize;
         }
-        Trap::Exception(Exception::StoreFault)
-        | Trap::Exception(Exception::StorePageFault)
-        | Trap::Exception(Exception::LoadFault)
-        | Trap::Exception(Exception::LoadPageFault) => {
-            println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.", stval, cx.sepc);
+        Trap::Exception(Exception::StoreFault) | Trap::Exception(Exception::StorePageFault) => {
+            // 写缺页：先尝试惰性补帧（mmap 区首次写），补不上才杀
+            if !handle_page_fault_current(VirtAddr::from(stval), MapPermission::W) {
+                println!(
+                    "[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.",
+                    stval, cx.sepc
+                );
+                exit_current_and_run_next();
+            }
+        }
+        Trap::Exception(Exception::LoadFault) | Trap::Exception(Exception::LoadPageFault) => {
+            // 读缺页：同上，需要 R 权限
+            if !handle_page_fault_current(VirtAddr::from(stval), MapPermission::R) {
+                println!("[kernel] PageFault in application, bad addr = {:#x}, bad instruction = {:#x}, kernel killed it.", stval, cx.sepc);
+            }
             exit_current_and_run_next();
         }
         Trap::Exception(Exception::IllegalInstruction) => {
@@ -116,12 +124,12 @@ pub fn trap_return() -> ! {
     // trace!("[kernel] trap_return: ..before return");
     unsafe {
         asm!(
-            "fence.i",
-            "jr {restore_va}",         // jump to new addr of __restore asm function
-            restore_va = in(reg) restore_va,
-            in("a0") trap_cx_ptr,      // a0 = virt addr of Trap Context
-            in("a1") user_satp,        // a1 = phy addr of usr page table
-            options(noreturn)
+        "fence.i",
+        "jr {restore_va}",         // jump to new addr of __restore asm function
+        restore_va = in(reg) restore_va,
+        in("a0") trap_cx_ptr,      // a0 = virt addr of Trap Context
+        in("a1") user_satp,        // a1 = phy addr of usr page table
+        options(noreturn)
         );
     }
 }
@@ -136,4 +144,5 @@ pub fn trap_from_kernel() -> ! {
     panic!("a trap {:?} from kernel!", scause::read().cause());
 }
 
+use crate::mm::{MapPermission, VirtAddr};
 pub use context::TrapContext;
